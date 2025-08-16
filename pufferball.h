@@ -9,21 +9,14 @@
 #include <stdio.h>
 #include <time.h>   
 
-
-
-
-//Ball Constants
 #define MAX_BALLS           10
 #define BALL_SPEED_MIN      220.0f
 #define BALL_SPEED_MAX      360.0f
-#define BALL_RADIUS         5
+#define BALL_RADIUS         10
 
-//Ball Spawn Consts
 #define SPAWN_ANGLE_JITTER  (float)(M_PI / 6) // +-30 degrees in radians
-#define CORNER_RADIUS       40.0f
+#define CORNER_RADIUS       75.0f
 #define SPAWN_MARGIN        1.0f
-
-#define AMP_FACTOR          1.25f //Speed multiplier when amplified
 #define BUMPER_INFLUENCE    0.50f //How much bump velocity biases reflection
 #define SEPARATION_EPSILON  0.75f //Sticking Avoidance
 
@@ -33,16 +26,19 @@
 #define WAVE_RANGE_SCALE    1.35f
 #define WAVE_SPEED_BOOST    1.35f
 
+enum { ARENA_PX = 800 };
+enum { HUD_TOP_PX = 75 };
+enum { NUM_AGENTS = 4 };
 
 #ifndef M_PI
 #define M_PI                3.14159265
 #endif
 
-
-//Bumper States
-enum { BUMPER_NORMAL = 0, BUMPER_AMPLIFIED = 1 };
-
-
+static const int   kStartingLives   = 15;
+static const float kFixedDt         = 1.0f/60.0f;  // deterministic sim step
+static const float kSpawnCooldown   = 0.75f;       // seconds with no balls before auto-spawn
+static const float kSpawnPeriod     = 5.0f;        // spawn a new ball every 5s
+static const float kBumperRadius    = 45.0f;       // pick the size you want    
 
 
 typedef struct {
@@ -52,10 +48,6 @@ typedef struct {
     float episode_length;
     float n;
 } Log;
-
-enum { ARENA_PX = 800 };
-enum { HUD_TOP_PX = 75 };
-
 
 typedef struct { int x, y ,w, h; } RectI;
 
@@ -67,75 +59,51 @@ typedef struct {
 } Client;
 
 
-// 2D vector
 typedef struct { float x, y; } Vector2f;
 
-// Construct & basic ops
+// Construct & ops
 static inline Vector2f v2(float x, float y)          { return (Vector2f){x,y}; }
 static inline Vector2f v2_add(Vector2f a, Vector2f b){ return v2(a.x+b.x, a.y+b.y); }
 static inline Vector2f v2_sub(Vector2f a, Vector2f b){ return v2(a.x-b.x, a.y-b.y); }
 static inline Vector2f v2_mul(Vector2f v, float s)   { return v2(v.x*s, v.y*s); }
-
-// Length & normalization
 static inline float    v2_len_sq(Vector2f v)         { return v.x*v.x + v.y*v.y; }
 static inline float    v2_len(Vector2f v)            { return sqrtf(v2_len_sq(v)); }
 static inline Vector2f v2_norm(Vector2f v)           { float L=v2_len(v); return (L>0)? v2(v.x/L, v.y/L) : v2(0,0); }
-
-// Dot & rotation
 static inline float    v2_dot(Vector2f a, Vector2f b){ return a.x*b.x + a.y*b.y; }
 static inline Vector2f v2_rot(Vector2f v, float ang) { float c=cosf(ang), s=sinf(ang); return v2(c*v.x - s*v.y, s*v.x + c*v.y); }
-
-// Axis helpers (for generic X/Y logic like goals)
 static inline float    v2_axis(Vector2f v, int axis)       { return axis ? v.y : v.x; }
 static inline float    v2_axis_orth(Vector2f v, int axis)  { return axis ? v.x : v.y; }
 
 
-
-
 typedef struct {
-    Vector2f    position;   //ellipse center
-    float       rx;         //ellipse radius along local x
-    float       ry;         //ellipse radius along local y
-    float       rotation;   //radians; local +x, +y 
-    
-    //Arc Limits in Elliptical Local Space
-
-    float angle_start;  //e.g. -PI/2
-    float angle_end;    //e.g. PI/2
-    
-    
+    Vector2f        position;   
+    float           length;        
+    float           height_at_center;        
+    float           rotation;   
     Vector2f        velocity; //Influence from bumper motion
     unsigned char   state;
     float           state_timer;
-
 } Bumper;
 
 typedef struct {
-    int agent;
-    int axis;
-    int dir;
-    float boundary;
-    float other_min;
-    float other_max;
+    int     agent;
+    int     axis;
+    int     dir;
+    float   boundary;
+    float   other_min;
+    float   other_max;
 } GoalSpec;
 
 typedef struct {
-    
     Vector2f        position;
     Vector2f        velocity;
-
     int             lives;
     bool            eliminated;
-    
     Bumper          bumper;
-    
-    float           amplify_cooldown;
-
-    //Wave Function
     bool            wave_active;
     float           wave_time;
+    float           wave_cooldown;
     Bumper          wave_bumper;
-
 } Agent; 
 
 typedef struct {
@@ -153,24 +121,17 @@ typedef struct {
     float*          rewards;
     unsigned char*  terminals;
     
+    Agent           agents_state[NUM_AGENTS];
+    Ball            balls[MAX_BALLS];
+    float           time_since_last_spawn;
+    bool            game_over;
+    int             winner_id;
 
-    // Internal Sim State
-
-    int size; //World Side Length
-
-    Agent agents_state[4];
-    Ball balls[MAX_BALLS];
-
-    float time_since_last_spawn;
-    bool game_over;
-    int winner_id;
-
-    //Arena Geometry
-    int arena_x;
-    int arena_y;
-    int arena_right;
-    int arena_bottom;
-    Vector2f arena_center;
+    int             arena_x;
+    int             arena_y;
+    int             arena_right;
+    int             arena_bottom;
+    Vector2f        arena_center;
 
 } pufferball;
 
@@ -180,8 +141,8 @@ typedef struct {
 void init(pufferball* env);
 void c_reset(pufferball* env);
 void c_step(pufferball* env);
-void c_render(pufferball* env);
-void c_close(pufferball* env);
+void c_render(pufferball* env, Client* c);
+void c_close(pufferball* env, Client* c);
 
 // sim pieces
 void spawn_ball(pufferball* env);
@@ -205,20 +166,16 @@ void compute_observations(pufferball* env);
 
 //Helper Functions
 
-//UI Layout
+//UI Layout (I am not fully convinved this separation of "World Units and Coordinate Geometery makes sense")
 static inline Client* client_create(int world_size) {
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(ARENA_PX, ARENA_PX + HUD_TOP_PX, "Pufferball");
     SetTargetFPS(60);
     if (!IsWindowReady()) return NULL;
-
     Client* c = calloc(1, sizeof(Client));
     c->win_w = ARENA_PX; c->win_h = ARENA_PX + HUD_TOP_PX; c->world_size = world_size;
-
     c->hud_top_px = (RectI){0,0, ARENA_PX, HUD_TOP_PX};
     c->arena_px   = (RectI){0,HUD_TOP_PX, ARENA_PX, ARENA_PX};
     c->world_to_px = (float)ARENA_PX / (float)world_size;
-
     c->cam = (Camera2D){
         .target = (Vector2){ world_size*0.5f, world_size*0.5f },
         .offset = (Vector2){ c->arena_px.x + c->arena_px.w*0.5f, c->arena_px.y + c->arena_px.h*0.5f },
@@ -230,13 +187,9 @@ static inline Client* client_create(int world_size) {
 
 static inline void client_destroy(Client* c){ if (c){ CloseWindow(); free(c);} }
 
-typedef void (*draw_world_fn)(const void* env);
-
-
 static inline float rnd_range(float a, float b){
     return a + ((float)rand() / (float)RAND_MAX) * (b - a);
 }
-
 
 static int alloc_ball_slot(pufferball* env) {
     for (int i = 0; i < MAX_BALLS; ++i) if (!env->balls[i].active) return i;
@@ -247,18 +200,6 @@ static inline float wrap_pi(float a){
     while (a <= -M_PI) a += 2.0f * (float)M_PI;
     while (a > M_PI) a -= 2.0f * (float)M_PI;
     return a;
-}
-
-static inline bool angle_in_range(float theta, float start, float end) {
-    theta = wrap_pi(theta);
-    start = wrap_pi(start);
-    end = wrap_pi(end);
-
-    if (start <= end) {
-        return (theta >= start && theta <= end);
-    } else {
-        return (theta >= start || theta <= end);
-    }
 }
 
 static inline Vector2f outward_normal_from_rotation(float rot){
@@ -313,144 +254,105 @@ static inline bool handle_corner_reflectors(pufferball* env, Ball* b) {
     return false; // no corners hit
 }
 
-
-enum { NUM_AGENTS = 4 };
-static const int   kStartingLives   = 15;
-static const float kFixedDt         = 1.0f/60.0f;  // deterministic sim step
-static const float kSpawnCooldown   = 0.75f;       // seconds with no balls before auto-spawn
-static const float kSpawnPeriod     = 5.0f;        // spawn a new ball every 5s
-// Use a single radius for a circular bumper (physics)
-static const float kBumperRadius    = 45.0f;   // pick the size you want
-static const float kBumperArcStart  = 0.0f;    // local +x -> +y is +90°
-static const float kBumperArcEnd    = (float)M_PI; // 180° span centered on local +y
-
-
-// Optional: keep the client private to this file
-static Client* s_client = NULL;
-
-// Small utility
-static inline void zero_balls(pufferball* env) {
+static inline void despawn_balls(pufferball* env) {
     for (int i = 0; i < MAX_BALLS; ++i) env->balls[i].active = false;
 }
 
 // Place 4 agents centered on each side, facing inward
 static void init_agents_on_walls(pufferball* env) {
-    const int   S  = env->size;
+    const int   S  = env->arena_x;
     const float cx = S * 0.5f;
 
     // Top (agent 0): outward normal points up, so use rotation = PI
     Agent* top = &env->agents_state[0];
     *top = (Agent){0};
-    top->position = (Vector2f){ cx, 0.0f };
-    top->lives = kStartingLives;
-    top->eliminated = false;
-    top->bumper.position    = top->position;
-    top->bumper.rx          = kBumperRadius;
-    top->bumper.ry          = kBumperRadius;
-    top->bumper.rotation    = (float)M_PI;
-    top->bumper.angle_start = kBumperArcStart;
-    top->bumper.angle_end   = kBumperArcEnd;
-    top->bumper.state       = BUMPER_NORMAL;
+    top->position                   = (Vector2f){ cx, 0.0f };
+    top->lives                      = kStartingLives;
+    top->eliminated                 = false;
+    top->bumper.position            = top->position;
+    top->bumper.length              = 1;
+    top->bumper.height_at_center    = 1;
+    top->bumper.rotation            = (float)M_PI;
+
 
     // Right (agent 1): outward +X, rotation = -PI/2
     Agent* right = &env->agents_state[1];
     *right = (Agent){0};
-    right->position = (Vector2f){ (float)S, cx };
-    right->lives = kStartingLives;
-    right->eliminated = false;
-    right->bumper.position    = right->position;
-    right->bumper.rx          = kBumperRadius;
-    right->bumper.ry          = kBumperRadius;
-    right->bumper.rotation    = -(float)M_PI/2.0f;
-    right->bumper.angle_start = kBumperArcStart;
-    right->bumper.angle_end   = kBumperArcEnd;
-    right->bumper.state       = BUMPER_NORMAL;
+    right->position                 = (Vector2f){ (float)S, cx };
+    right->lives                    = kStartingLives;
+    right->eliminated               = false;
+    right->bumper.position          = right->position;
+    right->bumper.length            = 1;
+    right->bumper.height_at_center  = 1;
+    right->bumper.rotation          = -(float)M_PI/2.0f;
 
     // Bottom (agent 2): outward +Y, rotation = 0
     Agent* bottom = &env->agents_state[2];
     *bottom = (Agent){0};
-    bottom->position = (Vector2f){ cx, (float)S };
-    bottom->lives = kStartingLives;
-    bottom->eliminated = false;
-    bottom->bumper.position    = bottom->position;
-    bottom->bumper.rx          = kBumperRadius;
-    bottom->bumper.ry          = kBumperRadius;
-    bottom->bumper.rotation    = 0.0f;
-    bottom->bumper.angle_start = kBumperArcStart;
-    bottom->bumper.angle_end   = kBumperArcEnd;
-    bottom->bumper.state       = BUMPER_NORMAL;
+    bottom->position                = (Vector2f){ cx, (float)S };
+    bottom->lives                   = kStartingLives;
+    bottom->eliminated              = false;
+    bottom->bumper.position         = bottom->position;
+    bottom->bumper.length           = 1;
+    bottom->bumper.height_at_center = 1;
+    bottom->bumper.rotation         = 0.0f;
 
     // Left (agent 3): outward -X, rotation = +PI/2
     Agent* left = &env->agents_state[3];
     *left = (Agent){0};
-    left->position = (Vector2f){ 0.0f, cx };
-    left->lives = kStartingLives;
-    left->eliminated = false;
-    left->bumper.position    = left->position;
-    left->bumper.rx          = kBumperRadius;
-    left->bumper.ry          = kBumperRadius;
-    left->bumper.rotation    = (float)M_PI/2.0f;
-    left->bumper.angle_start = kBumperArcStart;
-    left->bumper.angle_end   = kBumperArcEnd;
-    left->bumper.state       = BUMPER_NORMAL;
+    left->position                  = (Vector2f){ 0.0f, cx };
+    left->lives                     = kStartingLives;
+    left->eliminated                = false;
+    left->bumper.position           = left->position;
+    left->bumper.length             = 1;
+    left->bumper.height_at_center   = 1;
+    left->bumper.rotation           = (float)M_PI/2.0f;
 }
 
 void init(pufferball* env) {
     
     srand((unsigned)time(NULL));
+
+    env->arena_x                = 0;
+    env->arena_y                = 0;
+    env->arena_right            = ARENA_PX;
+    env->arena_bottom           = ARENA_PX;
+    env->arena_center           = (Vector2f){ ARENA_PX * 0.5f, ARENA_PX * 0.5f };
+    env->log                    = (Log){0};
+    env->time_since_last_spawn  = 0.0f;
+    env->game_over              = false;
+    env->winner_id              = -1;
     
-    // World size in world units (align it 1:1 with your ARENA_PX for simplicity)
-    env->size = ARENA_PX;
-
-    // Arena in world coordinates (do NOT bake HUD offsets here)
-    env->arena_x      = 0;
-    env->arena_y      = 0;
-    env->arena_right  = env->size;
-    env->arena_bottom = env->size;
-    env->arena_center = (Vector2f){ env->size * 0.5f, env->size * 0.5f };
-
-    env->log = (Log){0};
-    env->time_since_last_spawn = 0.0f;
-    env->game_over = false;
-    env->winner_id = -1;
-
-    zero_balls(env);
+    despawn_balls(env);
     init_agents_on_walls(env);
-
-    // Optionally, prime with a first ball
     spawn_ball(env);
 }
 
 void c_reset(pufferball* env) {
-    env->log = (Log){0};
-    env->game_over = false;
-    env->winner_id = -1;
-    env->time_since_last_spawn = 0.0f;
 
-    // Keep arena dims the same; just reset agents/balls
+    env->log                    = (Log){0};
+    env->game_over              = false;
+    env->winner_id              = -1;
+    env->time_since_last_spawn  = 0.0f;
+
     init_agents_on_walls(env);
-    zero_balls(env);
+    despawn_balls(env);
     spawn_ball(env);
 }
 
 void c_step(pufferball* env) {
+    
     if (env->game_over) return;
 
     const float dt = kFixedDt;
 
-    // Agents (cooldowns, wave propagation, bumper velocity sync, etc.)
     update_agent_states(env, dt);
-
-    // Ball integration & collisions
     update_ball_positions(env, dt);
     handle_ball_collisions(env);
-
-    // Scoring & elimination (must run after collisions)
     check_goal_hit(env);
+
     if (env->game_over) return;
 
-    // Spawning logic:
-    // (A) If no balls, spawn immediately to keep the game going
     bool any_active = false;
     for (int i = 0; i < MAX_BALLS; ++i) {
         if (env->balls[i].active) { any_active = true; break; }
@@ -459,7 +361,6 @@ void c_step(pufferball* env) {
         spawn_ball(env);
         env->time_since_last_spawn = 0.0f;
     } else {
-        // (B) Otherwise, spawn an additional ball every kSpawnPeriod seconds
         env->time_since_last_spawn += dt;
         if (env->time_since_last_spawn >= kSpawnPeriod) {
             env->time_since_last_spawn = 0.0f;
@@ -470,40 +371,7 @@ void c_step(pufferball* env) {
     // compute_observations(env); // keep stubbed if you want
 }
 
-// Draw a semicircle centered at `center`, radius `r`, facing along `normal`.
-// Thickness is in pixels. Works inside BeginMode2D.
-static inline void draw_semicircle_thick(Vector2 center, float r,
-    Vector2f normal, float thick_px,
-    Color col, int segs)
-{
-float nx = normal.x, ny = normal.y;
-float L = sqrtf(nx*nx + ny*ny);
-if (L <= 1e-6f) return;
-nx /= L; ny /= L;
-// t is normal rotated +90° (screen coords)
-Vector2f t = (Vector2f){ ny, -nx };
 
-Vector2 prev = {0};
-bool have_prev = false;
-for (int i = 0; i <= segs; ++i) {
-float u  = (float)i / (float)segs;
-float th = -(float)M_PI*0.5f + u * (float)M_PI;   // [-90°, +90°]
-float dx = r * (cosf(th)*t.x + sinf(th)*nx);
-float dy = r * (cosf(th)*t.y + sinf(th)*ny);
-Vector2 cur = (Vector2){ center.x + dx, center.y + dy };
-if (have_prev) DrawLineEx(prev, cur, thick_px, col);
-else           have_prev = true;
-prev = cur;
-}
-}
-
-
-static inline bool bumper_is_circle(const Bumper* b) {
-    return fabsf(b->rx - b->ry) < 1e-4f;
-}
-
-
-// Simple world drawer used by c_render (balls + goal mouths + optional corner circles)
 // Simple world drawer used by c_render (balls + goal mouths + paddles + corner circles)
 static void draw_world_2d(const void* ptr) {
     const pufferball* env = (const pufferball*)ptr;
@@ -542,63 +410,45 @@ static void draw_world_2d(const void* ptr) {
         DrawCircleV((Vector2){ b->position.x, b->position.y }, BALL_RADIUS, RAYWHITE);
     }
 
-// --- Paddles: thick semicircles (facing inward) ---
+// --- Paddles: ---
 
     const float THICK_PX = 10.0f;
-    const int   SEG      = 64;
 
     for (int a = 0; a < NUM_AGENTS; ++a) {
         const Agent* ag = &env->agents_state[a];
         if (ag->eliminated) continue;
 
         const Bumper* bp = &ag->bumper;
-        Vector2  center  = (Vector2){ bp->position.x, bp->position.y };
-        float    radius  = bp->rx;  // rx == ry in your setup
+        //REDO BUMPER DRAWING
 
         // inward = -outward
         Vector2f n_out = outward_normal_from_rotation(bp->rotation);
         Vector2f n_in  = (Vector2f){ -n_out.x, -n_out.y };
 
-        draw_semicircle_thick(center, radius, n_in, THICK_PX, AGENT_COLORS[a], SEG);
-
         if (ag->wave_active) {
             Color wave = AGENT_COLORS[a]; wave.a = 160;
             Vector2 c2 = (Vector2){ ag->wave_bumper.position.x, ag->wave_bumper.position.y };
-            draw_semicircle_thick(c2, ag->wave_bumper.rx, n_in, THICK_PX, wave, SEG);
         }
     }
     
 
-    // Optional: also draw the outward normal line for each active bumper
-    for (int a = 0; a < NUM_AGENTS; ++a) {
-        const Agent* ag = &env->agents_state[a];
-        if (ag->eliminated) continue;
-        Vector2f n = outward_normal_from_rotation(ag->bumper.rotation);
-        Vector2f p0 = ag->bumper.position;
-        Vector2f p1 = (Vector2f){ p0.x + n.x * 20.0f, p0.y + n.y * 20.0f };
-        DrawLine((int)p0.x, (int)p0.y, (int)p1.x, (int)p1.y, AGENT_COLORS[a]);
-    }
+    /* TODO: Create a toggleable vector line that is displayed when a ball collides with a 
+    paddle highlighting the direction and intensity of the reflection.
+    */
+
 }
 
 
-void c_render(pufferball* env) {
-    if (!s_client) {
-        s_client = client_create(env->size);
-        if (!s_client) return;
-    }
-
+void c_render(pufferball* env, Client* c) {
     // Build colored lives readout
     // T (red), R (cyan), B (pink), L (yellow)
     const int fontSize = 24;
-    int x = s_client->hud_top_px.x + 12;
-    int y = s_client->hud_top_px.y + 10;
-
+    int x = c->hud_top_px.x + 12;
+    int y = c->hud_top_px.y + 10;
     BeginDrawing();
     ClearBackground(BLACK);
-
-    // HUD background
-    DrawRectangle(s_client->hud_top_px.x, s_client->hud_top_px.y,
-                  s_client->hud_top_px.w, s_client->hud_top_px.h, (Color){20,20,28,255});
+    DrawRectangle(c->hud_top_px.x, c->hud_top_px.y,
+                  c->hud_top_px.w, c->hud_top_px.h, (Color){20,20,28,255});
 
     char buf[32];
 
@@ -622,23 +472,22 @@ void c_render(pufferball* env) {
     DrawText(buf, x, y, fontSize, YELLOW);
 
     // World view
-    BeginScissorMode(s_client->arena_px.x, s_client->arena_px.y,
-                     s_client->arena_px.w, s_client->arena_px.h);
-    BeginMode2D(s_client->cam);
+    BeginScissorMode(c->arena_px.x, c->arena_px.y,
+                     c->arena_px.w, c->arena_px.h);
+    BeginMode2D(c->cam);
     draw_world_2d(env);                   // draw in world units
-    DrawRectangleLines(0, 0, s_client->world_size, s_client->world_size, GRAY);
+    DrawRectangleLines(0, 0, c->world_size, c->world_size, GRAY);
     EndMode2D();
     EndScissorMode();
-
     EndDrawing();
 }
 
 
-void c_close(pufferball* env) {
+void c_close(pufferball* env, Client* c) {
     (void)env; // currently unused
-    if (s_client) {
-        client_destroy(s_client);
-        s_client = NULL;
+    if (c) {
+        client_destroy(c);
+        c = NULL;
     }
     // If you later malloc env->observations/actions/rewards/terminals, free them here.
 }
@@ -847,14 +696,6 @@ bool check_ball_bumper_collision(Ball* ball, Bumper* bumper){
         return fabsf(d - R) <= BALL_RADIUS;
     }
 
-    // ---- fallback: original ellipse/arc logic ----
-    float qx = lx / bumper->rx;
-    float qy = ly / bumper->ry;
-    float r = sqrtf(qx*qx + qy*qy);
-    float theta = atan2f(qy, qx);
-    if (!angle_in_range(theta, bumper->angle_start, bumper->angle_end)) return false;
-    float r_inflate = fmaxf(BALL_RADIUS / bumper->rx, BALL_RADIUS / bumper->ry);
-    return fabsf(r - 1.0f) <= r_inflate;
 }
 
 
@@ -885,9 +726,8 @@ void reflect_ball(Ball* ball, const Bumper* bumper) {
         Vector2f v_ref = v2_sub(v_rel, v2_mul(nW, 2.0f*vn));
         Vector2f v_new = v2_add(v_ref, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
 
-        float scale = (bumper->state == BUMPER_AMPLIFIED) ? AMP_FACTOR : 1.0f;
-        ball->velocity.x = v_new.x * scale;
-        ball->velocity.y = v_new.y * scale;
+        ball->velocity.x = v_new.x;
+        ball->velocity.y = v_new.y;
 
         // Nudge out to avoid re-penetration
         ball->position.x += nW.x * SEPARATION_EPSILON;
@@ -907,9 +747,8 @@ void reflect_ball(Ball* ball, const Bumper* bumper) {
         if (vn < 0.0f) {
             Vector2f v_ref = v2_sub(v_rel, v2_mul(n_world, 2.0f*vn));
             Vector2f v_new = v2_add(v_ref, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-            float scale = (bumper->state == BUMPER_AMPLIFIED) ? AMP_FACTOR : 1.0f;
-            ball->velocity.x = v_new.x * scale;
-            ball->velocity.y = v_new.y * scale;
+            ball->velocity.x = v_new.x;
+            ball->velocity.y = v_new.y;
             ball->position.x += n_world.x * SEPARATION_EPSILON;
             ball->position.y += n_world.y * SEPARATION_EPSILON;
         }
@@ -932,9 +771,8 @@ void reflect_ball(Ball* ball, const Bumper* bumper) {
 
     Vector2f v_ref = v2_sub(v_rel, v2_mul(n_world, 2.0f*vn));
     Vector2f v_new = v2_add(v_ref, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-    float scale = (bumper->state == BUMPER_AMPLIFIED) ? AMP_FACTOR : 1.0f;
-    ball->velocity.x = v_new.x * scale;
-    ball->velocity.y = v_new.y * scale;
+    ball->velocity.x = v_new.x;
+    ball->velocity.y = v_new.y;
     ball->position.x += n_world.x * SEPARATION_EPSILON;
     ball->position.y += n_world.y * SEPARATION_EPSILON;
 }
