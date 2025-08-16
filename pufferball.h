@@ -39,7 +39,7 @@ static const float kFixedDt         = 1.0f/60.0f;  // deterministic sim step
 static const float kSpawnCooldown   = 0.75f;       // seconds with no balls before auto-spawn
 static const float kSpawnPeriod     = 5.0f;        // spawn a new ball every 5s
 static const float kBumperRadius    = 45.0f;       // pick the size you want    
-
+static const float kSpawnOffset     = CORNER_RADIUS + SPAWN_MARGIN;
 
 typedef struct {
     float perf;
@@ -500,34 +500,26 @@ void compute_observations(pufferball* env);
 
 void spawn_ball(pufferball* env) {
     
-    const float spawn_offset = CORNER_RADIUS + SPAWN_MARGIN;
-    
     int idx = alloc_ball_slot(env);
     if (idx < 0) return;
 
     int corner = rand() % 4;
-    Vector2f center;
+    Vector2f corner_spawn;
     switch (corner) {
-        case 0: center = (Vector2f) { (float)env->arena_x, (float)env->arena_y}; break; //TL
-        case 1: center = (Vector2f) { (float)env->arena_right, (float)env->arena_y}; break; //TR
-        case 2: center = (Vector2f) { (float)env->arena_right, (float)env->arena_bottom}; break; //BR
-        case 3: center = (Vector2f) { (float)env->arena_x, (float)env->arena_bottom}; break; //BL
+        case 0: corner_spawn = (Vector2f) { (float)env->arena_x, (float)env->arena_y}; break; //TL
+        case 1: corner_spawn = (Vector2f) { (float)env->arena_right, (float)env->arena_y}; break; //TR
+        case 2: corner_spawn = (Vector2f) { (float)env->arena_right, (float)env->arena_bottom}; break; //BR
+        case 3: corner_spawn = (Vector2f) { (float)env->arena_x, (float)env->arena_bottom}; break; //BL
     }
 
-    //Aim directly toward arena center then add small random angle jitter
     Vector2f arena_center = env->arena_center;
-    Vector2f dir = v2_norm((Vector2f){arena_center.x - center.x, arena_center.y - center.y});
+    Vector2f dir = v2_norm((Vector2f){arena_center.x - corner_spawn.x, arena_center.y - corner_spawn.y});
     float jitter = rnd_range(-SPAWN_ANGLE_JITTER, SPAWN_ANGLE_JITTER);
     dir = v2_rot(dir, jitter);
-
-    //Spawn just inside the reflective corner circle boundary along dir
-    Vector2f pos = (Vector2f){ center.x + dir.x*spawn_offset, center.y + dir.y*spawn_offset };
-
-    //Speed
+    Vector2f pos = (Vector2f){ corner_spawn.x + dir.x*kSpawnOffset, corner_spawn.y + dir.y*kSpawnOffset };
     float speed = rnd_range(BALL_SPEED_MIN, BALL_SPEED_MAX);
     Vector2f vel = (Vector2f){ dir.x * speed, dir.y * speed };
 
-    //Commit
     Ball* b = &env->balls[idx];
     b->position = pos;
     b->velocity = vel;
@@ -554,6 +546,7 @@ void update_ball_positions(pufferball* env, float dt){
             }
     }
 }
+
 void handle_ball_collisions(pufferball* env) {
     // Ball vs. Wall (+ corners first)
     for (int i = 0; i < MAX_BALLS; ++i) {
@@ -562,7 +555,7 @@ void handle_ball_collisions(pufferball* env) {
 
         // 1) Corner reflective circles FIRST
         if (handle_corner_reflectors(env, b)) {
-            continue; // avoid double-bounce
+            continue;
         }
 
         // Precompute mouth spans
@@ -686,15 +679,6 @@ bool check_ball_bumper_collision(Ball* ball, Bumper* bumper){
     float lx = c*dx + s*dy;
     float ly = -s*dx + c*dy;
 
-    if (bumper_is_circle(bumper)) {
-        // Semicircle facing **inward**: keep the local -Y half
-        if (ly > 0.0f) return false;
-
-        float d = sqrtf(lx*lx + ly*ly);
-        float R = bumper->rx; // == ry
-        // Contact band equals BALL_RADIUS in world units
-        return fabsf(d - R) <= BALL_RADIUS;
-    }
 
 }
 
@@ -702,80 +686,12 @@ bool check_ball_bumper_collision(Ball* ball, Bumper* bumper){
 void reflect_ball(Ball* ball, const Bumper* bumper) {
     float dx = ball->position.x - bumper->position.x;
     float dy = ball->position.y - bumper->position.y;
-
     float c = cosf(bumper->rotation);
     float s = sinf(bumper->rotation);
     float lx = c*dx + s*dy;
     float ly = -s*dx + c*dy;
-
-    if (bumper_is_circle(bumper)) {
-        float d = sqrtf(lx*lx + ly*ly);
-        if (d < 1e-6f) return;       // degenerate: ball at center
-        if (ly > 0.0f) return;       // outside the active semicircle (facing inward)
-
-        // Local radial normal -> world
-        Vector2f nL = (Vector2f){ lx/d, ly/d };
-        Vector2f nW = (Vector2f){ c*nL.x - s*nL.y, s*nL.x + c*nL.y };
-        nW = v2_norm(nW);
-
-        // Relative velocity and reflection
-        Vector2f v_rel = v2_sub(ball->velocity, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-        float vn = v2_dot(v_rel, nW);
-        if (vn >= 0.0f) return;      // moving away
-
-        Vector2f v_ref = v2_sub(v_rel, v2_mul(nW, 2.0f*vn));
-        Vector2f v_new = v2_add(v_ref, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-
-        ball->velocity.x = v_new.x;
-        ball->velocity.y = v_new.y;
-
-        // Nudge out to avoid re-penetration
-        ball->position.x += nW.x * SEPARATION_EPSILON;
-        ball->position.y += nW.y * SEPARATION_EPSILON;
-        return;
     }
 
-    // ---- fallback: original ellipse reflection ----
-    float qx = lx / bumper->rx;
-    float qy = ly / bumper->ry;
-    float qlen = sqrtf(qx*qx + qy*qy);
-    if (qlen == 0.0f) {
-        Vector2f n_world = (Vector2f){ -s, c };
-        n_world = v2_norm(n_world);
-        Vector2f v_rel = v2_sub(ball->velocity, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-        float vn = v2_dot(v_rel, n_world);
-        if (vn < 0.0f) {
-            Vector2f v_ref = v2_sub(v_rel, v2_mul(n_world, 2.0f*vn));
-            Vector2f v_new = v2_add(v_ref, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-            ball->velocity.x = v_new.x;
-            ball->velocity.y = v_new.y;
-            ball->position.x += n_world.x * SEPARATION_EPSILON;
-            ball->position.y += n_world.y * SEPARATION_EPSILON;
-        }
-        return;
-    }
-
-    float ux = qx / qlen, uy = qy / qlen;
-    float ex = bumper->rx * ux, ey = bumper->ry * uy;
-    float nxL = ex / (bumper->rx * bumper->rx);
-    float nyL = ey / (bumper->ry * bumper->ry);
-    float nL_len = sqrtf(nxL*nxL + nyL*nyL);
-    if (nL_len > 0.0f) { nxL /= nL_len; nyL /= nL_len; }
-
-    Vector2f n_world = (Vector2f){ c*nxL - s*nyL, s*nxL + c*nyL };
-    n_world = v2_norm(n_world);
-
-    Vector2f v_rel = v2_sub(ball->velocity, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-    float vn = v2_dot(v_rel, n_world);
-    if (vn >= 0.0f) return;
-
-    Vector2f v_ref = v2_sub(v_rel, v2_mul(n_world, 2.0f*vn));
-    Vector2f v_new = v2_add(v_ref, v2_mul(bumper->velocity, BUMPER_INFLUENCE));
-    ball->velocity.x = v_new.x;
-    ball->velocity.y = v_new.y;
-    ball->position.x += n_world.x * SEPARATION_EPSILON;
-    ball->position.y += n_world.y * SEPARATION_EPSILON;
-}
 
 
 //Agents
@@ -784,9 +700,9 @@ void update_agent_states(pufferball* env, float dt){
         Agent* a = &env->agents_state[i];
 
         //Tick amplify cooldown
-        if (a->amplify_cooldown > 0.0f){
-            a->amplify_cooldown -= dt;
-            if (a->amplify_cooldown < 0.0f) a->amplify_cooldown = 0.0f;
+        if (a->wave_cooldown > 0.0f){
+            a->wave_cooldown -= dt;
+            if (a->wave_cooldown < 0.0f) a->wave_cooldown = 0.0f;
         }
 
         //Keep the static bumper's velocity in sync with agent motion (if any)
@@ -813,32 +729,25 @@ void update_agent_states(pufferball* env, float dt){
     }
 }
 
-bool activate_amplify(Agent* agent) {
+bool activate_wave(Agent* agent) {
     if (agent->eliminated){ 
         return false;
     }
-    if (agent->amplify_cooldown > 0.0f) {
+    if (agent->wave_cooldown > 0.0f) {
         return false;
     }
 
-    //Initialize wave state
     agent->wave_active = true;
     agent->wave_time = 0.0f;
-    agent-> amplify_cooldown = AMP_COOLDOWN_SEC;
-
+    agent-> wave_cooldown = AMP_COOLDOWN_SEC;
     agent->wave_bumper = agent->bumper;
-    agent->wave_bumper.rx *= WAVE_RANGE_SCALE;
-    agent->wave_bumper.ry *= WAVE_RANGE_SCALE;
-    agent->wave_bumper.state = BUMPER_AMPLIFIED;
+    agent->wave_bumper.length *= WAVE_RANGE_SCALE;
     agent->wave_bumper.state_timer = WAVE_DURATION_SEC;
-
     agent->wave_bumper.position = agent->bumper.position;
 
     return true;
 }
 
-
-//Game Rules
 void check_goal_hit(pufferball* env){
     const float gx_min = goal_min_x(env);
     const float gx_max = goal_max_x(env);
@@ -867,52 +776,42 @@ void check_goal_hit(pufferball* env){
             const float v_axis = v2_axis(b->velocity, s->axis);
             const float p_orth = v2_axis_orth(b->position, s->axis);
 
-            //must be moving toward the tail
+            //Checks if the ball is moving towards the active goal
             if (s->dir > 0 ? (v_axis <= 0.0f) : (v_axis >= 0.0f)) continue;
 
-            //cross the boundary with ball radius considered
+            //Checks if the ball's edge has crossed the goal
             const float edge = p_axis + s->dir * BALL_RADIUS;
             if (s->dir > 0 ? (edge < s->boundary) : (edge > s->boundary)) continue;
 
-            //within the goal mouth span on the orthogonal axis
+            //Checks to make sure the ball didn't hit the corner spawns
             if(!betweenf(p_orth, s->other_min, s->other_max)) continue;
 
             a->lives -= 1;
             if (a->lives <= 0) eliminate_agent(env, s->agent);
-
             b->active = false;
             break;
         }
-
     }
-
 }
+
 void eliminate_agent(pufferball* env, int agent_id){
+    
     if (agent_id < 0 || agent_id >= 4) return;
     Agent* a = &env->agents_state[agent_id];
     if(a->eliminated) return;
-
     a->eliminated = true;
-
-    //Cancel Wave
     a->wave_active = false;
     a->wave_time = 0.0f;
-
-    //Reset Bumper State
-    a->bumper.state = BUMPER_NORMAL;
     a->bumper.state_timer = 0.0f;
-
-    //Optional: Zero Cooldowns / Velocity
-
-    a->amplify_cooldown = 0.0f;
     a->velocity.x = a->velocity.y = 0.0f;
-
     check_game_over(env);
 }
+
 void check_game_over(pufferball* env){
+    
     int alive_id = -1;
     int alive_count = 0;
-
+    
     for (int i = 0; i < 4; ++i) {
         if (!env->agents_state[i].eliminated && env->agents_state[i].lives > 0) {
             alive_id = i;
