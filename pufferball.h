@@ -77,12 +77,16 @@ static inline float    v2_axis_orth(Vector2f v, int axis)  { return axis ? v.x :
 
 typedef struct {
     Vector2f        position;   
-    float           length;        
-    float           height_at_center;        
+    float           chord;        
+    float           sagitta;        
     float           rotation;   
     Vector2f        velocity; //Influence from bumper motion
     unsigned char   state;
     float           state_timer;
+    float           radius;
+    float           center_off;
+    float           half_angle;
+    float           cos_rot, sin_rot;
 } Bumper;
 
 typedef struct {
@@ -127,10 +131,10 @@ typedef struct {
     bool            game_over;
     int             winner_id;
 
-    int             arena_x;
-    int             arena_y;
-    int             arena_right;
-    int             arena_bottom;
+    int             arena_x_min;
+    int             arena_y_min;
+    int             arena_x_max;
+    int             arena_y_max;
     Vector2f        arena_center;
 
 } pufferball;
@@ -165,6 +169,43 @@ void compute_observations(pufferball* env);
 
 
 //Helper Functions
+
+static inline void bumper_precompute(Bumper* b) {
+    float c = fmaxf(1e-6f, b->chord);
+    float s = fabsf(b->sagitta);
+    float a = 0.5f * c;
+
+    s = fminf(s, a);
+
+    float R =  (a*a + s*s) / (2.0f * s);
+    float d = R - s;
+
+    b->radius = R;
+    b->center_off = d;
+    b->half_angle = atanf(a / d);
+    b->cos_rot = cosf(b->rotation);
+    b->sin_rot = sinf(b->rotation);
+}
+
+static void bumper_init_from_edge(Bumper* b, Vector2f p0, Vector2f p1, float sagitta_mag, Vector2f arena_cetner) {
+    Vector2f mid = v2_mul(v2_add(p0, p1), 0.5f);
+    Vector2f chord_vec = v2_sub(p1, p0);
+    float chord = hypotf(chord_vec.x, chord_vec.y);
+    float rot = atan2f(chord_vec.y, chord_vec.x);
+
+    b->position = mid;
+    b->chord = chord;
+    b->rotation = rot;
+    
+    //Mapping Sagitta toward center
+    Vector2f to_center_world = v2_sub(arena_cetner, mid);
+    Vector2f to_center_local = v2_rot(to_center_world, -rot);
+    float s  = (to_center_local.y >= 0.0f) ? fabsf(sagitta_mag) : -fabsf(sagitta_mag);
+    b->sagitta = s;
+    
+    bumper_precompute(b);
+
+}
 
 //UI Layout (I am not fully convinved this separation of "World Units and Coordinate Geometery makes sense")
 static inline Client* client_create(int world_size) {
@@ -209,10 +250,10 @@ static inline Vector2f outward_normal_from_rotation(float rot){
 
 //Goal Helpers
 static inline bool betweenf(float v, float a, float b) { return v >= a && v <= b; }
-static inline float goal_min_x(const pufferball* env) { return env->arena_x + CORNER_RADIUS; }
-static inline float goal_max_x(const pufferball* env) { return env->arena_right - CORNER_RADIUS; }
-static inline float goal_min_y(const pufferball* env) { return env->arena_y + CORNER_RADIUS; }
-static inline float goal_max_y(const pufferball* env) { return env->arena_bottom - CORNER_RADIUS; }
+static inline float goal_min_x(const pufferball* env) { return env->arena_x_min + CORNER_RADIUS; }
+static inline float goal_max_x(const pufferball* env) { return env->arena_x_max - CORNER_RADIUS; }
+static inline float goal_min_y(const pufferball* env) { return env->arena_y_min + CORNER_RADIUS; }
+static inline float goal_max_y(const pufferball* env) { return env->arena_x_max - CORNER_RADIUS; }
 
 //Corner Circle Helpers
 static inline void reflect_circle(Ball* b, float cx, float cy) {
@@ -235,10 +276,10 @@ static inline bool handle_corner_reflectors(pufferball* env, Ball* b) {
     const float r2 = (CORNER_RADIUS + BALL_RADIUS) * (CORNER_RADIUS + BALL_RADIUS);
 
     // four corners (arena rect must be precomputed in env)
-    float cx[4] = { (float)env->arena_x, (float)env->arena_right,
-                    (float)env->arena_right, (float)env->arena_x };
-    float cy[4] = { (float)env->arena_y, (float)env->arena_y,
-                    (float)env->arena_bottom, (float)env->arena_bottom };
+    float cx[4] = { (float)env->arena_x_min, (float)env->arena_x_max,
+                    (float)env->arena_x_max, (float)env->arena_x_min };
+    float cy[4] = { (float)env->arena_y_min, (float)env->arena_y_min,
+                    (float)env->arena_y_max, (float)env->arena_y_max };
 
     for (int k = 0; k < 4; ++k) {
         float dx = b->position.x - cx[k];
@@ -260,7 +301,7 @@ static inline void despawn_balls(pufferball* env) {
 
 // Place 4 agents centered on each side, facing inward
 static void init_agents_on_walls(pufferball* env) {
-    const int   S  = env->arena_x;
+    const int   S  = env->arena_x_min;
     const float cx = S * 0.5f;
 
     // Top (agent 0): outward normal points up, so use rotation = PI
@@ -270,32 +311,26 @@ static void init_agents_on_walls(pufferball* env) {
     top->lives                      = kStartingLives;
     top->eliminated                 = false;
     top->bumper.position            = top->position;
-    top->bumper.length              = 1;
-    top->bumper.height_at_center    = 1;
-    top->bumper.rotation            = (float)M_PI;
+    
 
 
     // Right (agent 1): outward +X, rotation = -PI/2
     Agent* right = &env->agents_state[1];
     *right = (Agent){0};
-    right->position                 = (Vector2f){ (float)S, cx };
+    right->position                 = (Vector2f){ 0.0f, cx };
     right->lives                    = kStartingLives;
     right->eliminated               = false;
     right->bumper.position          = right->position;
-    right->bumper.length            = 1;
-    right->bumper.height_at_center  = 1;
-    right->bumper.rotation          = -(float)M_PI/2.0f;
+    
 
     // Bottom (agent 2): outward +Y, rotation = 0
     Agent* bottom = &env->agents_state[2];
     *bottom = (Agent){0};
-    bottom->position                = (Vector2f){ cx, (float)S };
+    bottom->position                = (Vector2f){ cx, 0.0f };
     bottom->lives                   = kStartingLives;
     bottom->eliminated              = false;
     bottom->bumper.position         = bottom->position;
-    bottom->bumper.length           = 1;
-    bottom->bumper.height_at_center = 1;
-    bottom->bumper.rotation         = 0.0f;
+   
 
     // Left (agent 3): outward -X, rotation = +PI/2
     Agent* left = &env->agents_state[3];
@@ -304,19 +339,17 @@ static void init_agents_on_walls(pufferball* env) {
     left->lives                     = kStartingLives;
     left->eliminated                = false;
     left->bumper.position           = left->position;
-    left->bumper.length             = 1;
-    left->bumper.height_at_center   = 1;
-    left->bumper.rotation           = (float)M_PI/2.0f;
+  
 }
 
 void init(pufferball* env) {
     
     srand((unsigned)time(NULL));
 
-    env->arena_x                = 0;
-    env->arena_y                = 0;
-    env->arena_right            = ARENA_PX;
-    env->arena_bottom           = ARENA_PX;
+    env->arena_x_min                = 0;
+    env->arena_y_min                = 0;
+    env->arena_x_max            = ARENA_PX;
+    env->arena_y_max           = ARENA_PX;
     env->arena_center           = (Vector2f){ ARENA_PX * 0.5f, ARENA_PX * 0.5f };
     env->log                    = (Log){0};
     env->time_since_last_spawn  = 0.0f;
@@ -389,19 +422,19 @@ static void draw_world_2d(const void* ptr) {
     const float gy_min = goal_min_y(env), gy_max = goal_max_y(env);
 
     // Top goal
-    DrawLine((int)gx_min, env->arena_y, (int)gx_max, env->arena_y, (Color){80,160,255,255});
+    DrawLine((int)gx_min, env->arena_y_min, (int)gx_max, env->arena_y_min, (Color){80,160,255,255});
     // Right goal
-    DrawLine(env->arena_right, (int)gy_min, env->arena_right, (int)gy_max, (Color){80,160,255,255});
+    DrawLine(env->arena_x_max, (int)gy_min, env->arena_x_max, (int)gy_max, (Color){80,160,255,255});
     // Bottom goal
-    DrawLine((int)gx_min, env->arena_bottom, (int)gx_max, env->arena_bottom, (Color){80,160,255,255});
+    DrawLine((int)gx_min, env->arena_y_max, (int)gx_max, env->arena_y_max, (Color){80,160,255,255});
     // Left goal
-    DrawLine(env->arena_x, (int)gy_min, env->arena_x, (int)gy_max, (Color){80,160,255,255});
+    DrawLine(env->arena_x_min, (int)gy_min, env->arena_x_min, (int)gy_max, (Color){80,160,255,255});
 
     // Corner reflectors (visualize)
-    DrawCircleLines(env->arena_x,      env->arena_y,      (int)CORNER_RADIUS, GRAY);
-    DrawCircleLines(env->arena_right,  env->arena_y,      (int)CORNER_RADIUS, GRAY);
-    DrawCircleLines(env->arena_right,  env->arena_bottom, (int)CORNER_RADIUS, GRAY);
-    DrawCircleLines(env->arena_x,      env->arena_bottom, (int)CORNER_RADIUS, GRAY);
+    DrawCircleLines(env->arena_x_min,      env->arena_y_min,      (int)CORNER_RADIUS, GRAY);
+    DrawCircleLines(env->arena_x_max,  env->arena_y_min,      (int)CORNER_RADIUS, GRAY);
+    DrawCircleLines(env->arena_x_max,  env->arena_y_max, (int)CORNER_RADIUS, GRAY);
+    DrawCircleLines(env->arena_x_min,      env->arena_y_max, (int)CORNER_RADIUS, GRAY);
 
     // Balls
     for (int i = 0; i < MAX_BALLS; ++i) {
@@ -506,10 +539,10 @@ void spawn_ball(pufferball* env) {
     int corner = rand() % 4;
     Vector2f corner_spawn;
     switch (corner) {
-        case 0: corner_spawn = (Vector2f) { (float)env->arena_x, (float)env->arena_y}; break; //TL
-        case 1: corner_spawn = (Vector2f) { (float)env->arena_right, (float)env->arena_y}; break; //TR
-        case 2: corner_spawn = (Vector2f) { (float)env->arena_right, (float)env->arena_bottom}; break; //BR
-        case 3: corner_spawn = (Vector2f) { (float)env->arena_x, (float)env->arena_bottom}; break; //BL
+        case 0: corner_spawn = (Vector2f) { (float)env->arena_x_min, (float)env->arena_y_min}; break; //TL
+        case 1: corner_spawn = (Vector2f) { (float)env->arena_x_max, (float)env->arena_y_min}; break; //TR
+        case 2: corner_spawn = (Vector2f) { (float)env->arena_x_max, (float)env->arena_y_max}; break; //BR
+        case 3: corner_spawn = (Vector2f) { (float)env->arena_x_min, (float)env->arena_y_max}; break; //BL
     }
 
     Vector2f arena_center = env->arena_center;
@@ -538,10 +571,10 @@ void update_ball_positions(pufferball* env, float dt){
         b->position.y += b->velocity.y * dt;
 
         // Optionally: Check if ball left arena entirely (out of bounds fail-safe)
-        if (b->position.x < env->arena_x - 100 ||
-            b->position.x > env->arena_right + 100 ||
-            b->position.y < env->arena_y - 100 ||
-            b->position.y > env->arena_bottom + 100) {
+        if (b->position.x < env->arena_x_min - 100 ||
+            b->position.x > env->arena_x_max + 100 ||
+            b->position.y < env->arena_y_min - 100 ||
+            b->position.y > env->arena_y_max + 100) {
                 b->active = false;
             }
     }
@@ -564,39 +597,39 @@ void handle_ball_collisions(pufferball* env) {
 
         // 2) Then walls, but only outside the goal mouths
         // Left wall
-        if (b->position.x - BALL_RADIUS < env->arena_x) {
+        if (b->position.x - BALL_RADIUS < env->arena_x_min) {
             float y = b->position.y;
             bool in_mouth = (y >= gy_min && y <= gy_max);
             if (!in_mouth) {
-                b->position.x = env->arena_x + BALL_RADIUS;
+                b->position.x = env->arena_x_min + BALL_RADIUS;
                 b->velocity.x *= -1.0f;
             }
         }
         // Right wall
-        else if (b->position.x + BALL_RADIUS > env->arena_right) {
+        else if (b->position.x + BALL_RADIUS > env->arena_x_max) {
             float y = b->position.y;
             bool in_mouth = (y >= gy_min && y <= gy_max);
             if (!in_mouth) {
-                b->position.x = env->arena_right - BALL_RADIUS;
+                b->position.x = env->arena_x_max - BALL_RADIUS;
                 b->velocity.x *= -1.0f;
             }
         }
 
         // Top wall
-        if (b->position.y - BALL_RADIUS < env->arena_y) {
+        if (b->position.y - BALL_RADIUS < env->arena_y_min) {
             float x = b->position.x;
             bool in_mouth = (x >= gx_min && x <= gx_max);
             if (!in_mouth) {
-                b->position.y = env->arena_y + BALL_RADIUS;
+                b->position.y = env->arena_y_min + BALL_RADIUS;
                 b->velocity.y *= -1.0f;
             }
         }
         // Bottom wall
-        else if (b->position.y + BALL_RADIUS > env->arena_bottom) {
+        else if (b->position.y + BALL_RADIUS > env->arena_y_max) {
             float x = b->position.x;
             bool in_mouth = (x >= gx_min && x <= gx_max);
             if (!in_mouth) {
-                b->position.y = env->arena_bottom - BALL_RADIUS;
+                b->position.y = env->arena_y_max - BALL_RADIUS;
                 b->velocity.y *= -1.0f;
             }
         }
@@ -756,10 +789,10 @@ void check_goal_hit(pufferball* env){
 
     const GoalSpec G[4] = {
         // agent, axis, dir, boundary,           other_min, other_max
-        { 0,     1,    -1,  (float)env->arena_y,     gx_min,   gx_max }, // TOP: y min, moving up (v_y < 0)
-        { 1,     0,    +1,  (float)env->arena_right, gy_min,   gy_max }, // RIGHT: x max, moving right (v_x > 0)
-        { 2,     1,    +1,  (float)env->arena_bottom,gx_min,   gx_max }, // BOTTOM: y max, moving down (v_y > 0)
-        { 3,     0,    -1,  (float)env->arena_x,     gy_min,   gy_max }, // LEFT: x min, moving left (v_x < 0)
+        { 0,     1,    -1,  (float)env->arena_y_min,     gx_min,   gx_max }, // TOP: y min, moving up (v_y < 0)
+        { 1,     0,    +1,  (float)env->arena_x_max, gy_min,   gy_max }, // RIGHT: x max, moving right (v_x > 0)
+        { 2,     1,    +1,  (float)env->arena_x_max,gx_min,   gx_max }, // BOTTOM: y max, moving down (v_y > 0)
+        { 3,     0,    -1,  (float)env->arena_x_min,     gy_min,   gy_max }, // LEFT: x min, moving left (v_x < 0)
     };
 
     for (int i = 0; i < MAX_BALLS; ++i) {
